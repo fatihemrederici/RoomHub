@@ -100,6 +100,6 @@ See the [privacy policy](docs/privacy.html).
 
 ## Author
 
-**Fatih Emre Derici**, iOS developer based in Łódź, Poland · [LinkedIn](https://www.linkedin.com/in/fatihemrederici)
+**Fatih Emre Derici**, Software Developer based in Łódź, Poland · [LinkedIn](https://www.linkedin.com/in/fatihemrederici)
 
 © 2026 Fatih Emre Derici. All rights reserved.
