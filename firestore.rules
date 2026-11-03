@@ -1,0 +1,236 @@
+rules_version = '2';
+
+// RoomHub — Firestore güvenlik kuralları
+// Firebase Console → Firestore Database → Rules sekmesine bu dosyanın TAMAMINI yapıştırıp "Publish" deyin.
+//
+// Veri modeli:
+//   users/{uid}                       → kullanıcı profili
+//   invites/{kod}                     → davet kodu → houseId eşlemesi (sadece tek tek okunabilir, listelenemez)
+//   houses/{houseId}                  → ev (sadece üyeler okuyabilir)
+//   houses/{houseId}/expenses/{id}    → harcamalar
+//   houses/{houseId}/settlements/{id} → ödeşmeler
+//   houses/{houseId}/chores/{id}      → görevler
+//   expenses|chores|settlements/{id}  → ESKİ (üst seviye) koleksiyonlar; sadece taşıma için okunur/silinir
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Yardımcılar ----------
+    function signedIn() { return request.auth != null; }
+    function me() { return request.auth.uid; }
+    function houseDoc(houseId) { return get(/databases/$(database)/documents/houses/$(houseId)); }
+    function houseDocAfter(houseId) { return getAfter(/databases/$(database)/documents/houses/$(houseId)); }
+    function isMemberOf(houseId) { return signedIn() && houseId is string && me() in houseDoc(houseId).data.members; }
+    function adminsOf(h) { return h.get('admins', []); }
+    function isAdminOfData(h) { return h.createdBy == me() || me() in adminsOf(h); }
+    function changedKeys() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function validText(s, maxLen) { return s is string && s.size() > 0 && s.size() <= maxLen; }
+    function validCurrency(c) { return c is string && c.size() == 3; }
+    function optionalImage(d, field) {
+      return !(field in d) || (d[field] is string && d[field].size() < 300000);
+    }
+
+    // ---------- Kullanıcılar ----------
+    function sharesHouseWith(userData) {
+      return userData.get('houseId', null) is string
+        && me() in houseDoc(userData.houseId).data.members;
+    }
+    function validUser(d) {
+      return validText(d.name, 50)
+        && d.email is string
+        && optionalImage(d, 'photoBase64');
+    }
+    function houseIdChangeAllowed() {
+      let newHouse = request.resource.data.get('houseId', null);
+      let oldHouse = resource.data.get('houseId', null);
+      return newHouse == oldHouse
+        || newHouse == null
+        || (newHouse is string && me() in houseDocAfter(newHouse).data.members);
+    }
+
+    match /users/{userId} {
+      allow get: if signedIn() && (me() == userId || sharesHouseWith(resource.data));
+      allow list: if false;
+      allow create: if signedIn() && me() == userId
+        && request.resource.data.keys().hasOnly(['name', 'email', 'photoBase64', 'createdAt'])
+        && validUser(request.resource.data);
+      allow update: if signedIn() && me() == userId
+        && validUser(request.resource.data)
+        && request.resource.data.email == resource.data.email
+        && houseIdChangeAllowed();
+      allow delete: if signedIn() && me() == userId;
+    }
+
+    // ---------- Davet kodları ----------
+    match /invites/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['houseId', 'createdBy', 'createdAt'])
+        && request.resource.data.houseId is string
+        && request.resource.data.createdBy == me()
+        && isAdminOfData(houseDocAfter(request.resource.data.houseId).data)
+        && houseDocAfter(request.resource.data.houseId).data.inviteCode == code;
+      allow delete: if signedIn() && isAdminOfData(houseDoc(resource.data.houseId).data);
+      allow update: if false;
+    }
+
+    // ---------- Evler ----------
+    function validNewHouse(d) {
+      return d.keys().hasOnly(['houseName', 'createdBy', 'members', 'admins', 'inviteCode',
+                               'imageBase64', 'currencyCode', 'createdAt', 'pastMembers'])
+        && d.createdBy == me()
+        && d.members == [me()]
+        && (!('admins' in d) || d.admins.size() == 0)
+        && validText(d.houseName, 40)
+        && d.inviteCode is string && d.inviteCode.size() == 6
+        && (!('currencyCode' in d) || validCurrency(d.currencyCode))
+        && optionalImage(d, 'imageBase64');
+    }
+
+    // Davet koduyla katılma: sadece kendini ekleyebilir ve güncel kodu bilmek zorunda
+    function isJoin() {
+      let d = request.resource.data;
+      return changedKeys().hasOnly(['members', 'lastJoin'])
+        && d.lastJoin.uid == me()
+        && d.lastJoin.code == resource.data.inviteCode
+        && d.members.toSet() == resource.data.members.toSet().union([me()].toSet())
+        && d.members.size() <= 20;
+    }
+
+    // Evden ayrılma (sahipse sahiplik başka üyeye devredilmeli)
+    function isLeave() {
+      let d = request.resource.data;
+      let old = resource.data;
+      return me() in old.members
+        && changedKeys().hasOnly(['members', 'admins', 'createdBy', 'pastMembers'])
+        && d.members.toSet() == old.members.toSet().difference([me()].toSet())
+        && d.members.size() > 0
+        && adminsOf(d).toSet().difference(adminsOf(old).toSet()).size() == 0
+        && ((old.createdBy == me() && d.createdBy in d.members)
+            || (old.createdBy != me() && d.createdBy == old.createdBy));
+    }
+
+    // Admin düzenlemeleri: isim, foto, para birimi, davet kodu, adminler, üye çıkarma
+    function isAdminEdit() {
+      let d = request.resource.data;
+      let old = resource.data;
+      return isAdminOfData(old)
+        && changedKeys().hasOnly(['houseName', 'imageBase64', 'inviteCode', 'admins', 'members',
+                                  'pastMembers', 'currencyCode'])
+        && d.createdBy == old.createdBy
+        && d.members.toSet().difference(old.members.toSet()).size() == 0
+        && d.createdBy in d.members
+        && me() in d.members
+        && adminsOf(d).toSet().difference(d.members.toSet()).size() == 0
+        && validText(d.houseName, 40)
+        && d.inviteCode is string && d.inviteCode.size() == 6
+        && (!('currencyCode' in d) || validCurrency(d.currencyCode))
+        && optionalImage(d, 'imageBase64');
+    }
+
+    // Sahipliği devretme (sadece sahip)
+    function isOwnerTransfer() {
+      let d = request.resource.data;
+      let old = resource.data;
+      return old.createdBy == me()
+        && changedKeys().hasOnly(['createdBy', 'admins'])
+        && d.createdBy in old.members
+        && adminsOf(d).toSet().difference(old.members.toSet()).size() == 0;
+    }
+
+    match /houses/{houseId} {
+      allow get: if signedIn() && me() in resource.data.members;
+      allow list: if false;
+      allow create: if signedIn() && validNewHouse(request.resource.data);
+      allow update: if signedIn() && (isJoin() || isLeave() || isAdminEdit() || isOwnerTransfer());
+      // Sadece son üye olan sahip evi silebilir
+      allow delete: if signedIn()
+        && resource.data.createdBy == me()
+        && resource.data.members == [me()];
+
+      function isMember() { return isMemberOf(houseId); }
+      function members() { return houseDoc(houseId).data.members; }
+
+      // ESKİ üst seviye dokümandan birebir taşıma mı?
+      function isMigrationOf(collectionName, docId) {
+        let legacyPath = /databases/$(database)/documents/$(collectionName)/$(docId);
+        return exists(legacyPath)
+          && get(legacyPath).data.houseId == houseId
+          && request.resource.data.houseId == houseId;
+      }
+
+      // ----- Harcamalar -----
+      function validExpense(d) {
+        return d.houseId == houseId
+          && validText(d.title, 100)
+          && d.amount is number && d.amount > 0 && d.amount <= 100000000
+          && validCurrency(d.currencyCode)
+          && d.paidBy is string
+          && d.splitBetween is list && d.splitBetween.size() > 0
+          && d.splits is map;
+      }
+      match /expenses/{expenseId} {
+        allow read: if isMember();
+        allow create: if isMember() && (
+          (validExpense(request.resource.data)
+            && request.resource.data.createdBy == me()
+            && request.resource.data.paidBy in members()
+            && request.resource.data.splitBetween.hasOnly(members())
+            && request.resource.data.splits.keys().hasOnly(members()))
+          || isMigrationOf('expenses', expenseId));
+        allow update: if isMember() && validExpense(request.resource.data);
+        allow delete: if isMember();
+      }
+
+      // ----- Ödeşmeler -----
+      function validSettlement(d) {
+        return d.houseId == houseId
+          && d.fromUser is string && d.toUser is string && d.fromUser != d.toUser
+          && d.amount is number && d.amount > 0 && d.amount <= 100000000
+          && validCurrency(d.currencyCode);
+      }
+      match /settlements/{settlementId} {
+        allow read: if isMember();
+        allow create: if isMember() && (
+          (validSettlement(request.resource.data)
+            && (request.resource.data.fromUser == me() || request.resource.data.toUser == me()))
+          || isMigrationOf('settlements', settlementId));
+        // Sadece borçlu ya da alacaklı geri alabilir
+        allow delete: if isMember() && (resource.data.fromUser == me() || resource.data.toUser == me());
+        allow update: if false;
+      }
+
+      // ----- Görevler -----
+      function validChore(d) {
+        return d.houseId == houseId
+          && validText(d.title, 80)
+          && d.assignedTo is list
+          && d.frequency in ['one-time', 'daily', 'weekly', 'monthly']
+          && d.completed is bool;
+      }
+      match /chores/{choreId} {
+        allow read: if isMember();
+        allow create: if isMember() && (
+          (validChore(request.resource.data) && request.resource.data.assignedTo.hasOnly(members()))
+          || isMigrationOf('chores', choreId));
+        allow update: if isMember() && validChore(request.resource.data);
+        allow delete: if isMember();
+      }
+    }
+
+    // ---------- ESKİ üst seviye koleksiyonlar (sadece taşıma için) ----------
+    match /expenses/{id} {
+      allow read, delete: if isMemberOf(resource.data.houseId);
+      allow create, update: if false;
+    }
+    match /settlements/{id} {
+      allow read, delete: if isMemberOf(resource.data.houseId);
+      allow create, update: if false;
+    }
+    match /chores/{id} {
+      allow read, delete: if isMemberOf(resource.data.houseId);
+      allow create, update: if false;
+    }
+  }
+}
